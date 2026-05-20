@@ -1,7 +1,14 @@
-import cv2
-import numpy as np
+# main.py
+import sys
 from PyQt5.QtWidgets import QApplication
-import torch
-from telegram import Bot
+from gui import VideoSurveillanceGUI
 
-print("Все встановлено і готово!")
+
+def main():
+    app = QApplication(sys.argv)
+    window = VideoSurveillanceGUI()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
