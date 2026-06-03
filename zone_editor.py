@@ -1,25 +1,16 @@
-# zone_editor.py — Діалог малювання зон на відео-кадрі
+# zone_editor.py — Діалог малювання зон на відео-кадрі з підтримкою типів зон
 import cv2
 import numpy as np
 
 from PyQt5.QtWidgets import (
-    QDialog,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMessageBox,
-    QWidget,
-    QCheckBox,
-    QSplitter,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QWidget, QCheckBox, QSplitter, QComboBox,
 )
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPolygon
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 
-from zones import load_zones, save_zones
+from zones import load_zones, save_zones, ZONE_TYPES
 
 
 class ZoneCanvas(QLabel):
@@ -28,7 +19,7 @@ class ZoneCanvas(QLabel):
     Клік лівою — додає точку.
     Клік правою — закриває полігон.
     """
-    zone_finished = pyqtSignal(list)  # список точок [[x,y], ...]
+    zone_finished = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,7 +32,6 @@ class ZoneCanvas(QLabel):
         self._drawing = False
 
     def set_frame(self, frame_bgr: np.ndarray):
-        """Встановлює базовий кадр як фон полотна."""
         if frame_bgr is None or frame_bgr.size == 0:
             return
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -76,15 +66,11 @@ class ZoneCanvas(QLabel):
     def _finish_polygon(self):
         if len(self._points) < 3:
             return
-
-        # Конвертуємо точки канвасу у координати оригінального кадру (640x640)
         if self._base_pixmap is None:
             return
 
         pm_w = self._base_pixmap.width()
         pm_h = self._base_pixmap.height()
-
-        # offset — де пікселей починається зображення всередині QLabel
         label_w = self.width()
         label_h = self.height()
         offset_x = (label_w - pm_w) // 2
@@ -94,7 +80,6 @@ class ZoneCanvas(QLabel):
         for p in self._points:
             rel_x = p.x() - offset_x
             rel_y = p.y() - offset_y
-            # Нормалізуємо до 640x640
             norm_x = int(rel_x * 640 / pm_w)
             norm_y = int(rel_y * 640 / pm_h)
             norm_x = max(0, min(norm_x, 640))
@@ -116,17 +101,11 @@ class ZoneCanvas(QLabel):
         if self._points:
             pen = QPen(QColor(0, 220, 255), 2, Qt.SolidLine)
             painter.setPen(pen)
-
-            # Лінії між точками
             for i in range(len(self._points) - 1):
                 painter.drawLine(self._points[i], self._points[i + 1])
-
-            # Точки
             painter.setBrush(QColor(0, 220, 255))
             for p in self._points:
                 painter.drawEllipse(p, 5, 5)
-
-            # Замикаюча лінія (пунктир)
             if len(self._points) >= 3 and self._drawing:
                 pen.setStyle(Qt.DashLine)
                 pen.setColor(QColor(255, 200, 0))
@@ -138,24 +117,21 @@ class ZoneCanvas(QLabel):
 
 
 class ZoneEditorDialog(QDialog):
-    """
-    Повноцінний діалог керування зонами.
-    - Список існуючих зон зліва
-    - Канвас для малювання справа
-    - Кнопки: Нова зона, Видалити, Зберегти
-    """
+    """Повноцінний діалог керування зонами з підтримкою типів зон."""
 
     zones_updated = pyqtSignal(list)
 
     def __init__(self, parent=None, current_frame: np.ndarray = None):
         super().__init__(parent)
         self.setWindowTitle("Редактор зон виявлення")
-        self.resize(1000, 600)
+        self.resize(1050, 640)
         self.setModal(True)
 
         self._zones = load_zones()
         self._current_frame = current_frame
-        self._pending_points: list[list[int]] = []
+        self._pending_name = ""
+        self._pending_enabled = True
+        self._pending_type = "secondary"
 
         self._build_ui()
         self._refresh_list()
@@ -167,7 +143,7 @@ class ZoneEditorDialog(QDialog):
         main = QHBoxLayout(self)
         splitter = QSplitter(Qt.Horizontal)
 
-        # ── Ліва панель (список зон + кнопки) ──
+        # ── Ліва панель ──
         left = QWidget()
         left_layout = QVBoxLayout(left)
 
@@ -183,6 +159,16 @@ class ZoneEditorDialog(QDialog):
         name_row.addWidget(self.zone_name_edit)
         left_layout.addLayout(name_row)
 
+        # Тип зони
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Тип:"))
+        self.zone_type_combo = QComboBox()
+        for key, val in ZONE_TYPES.items():
+            self.zone_type_combo.addItem(val["label"], key)
+        self.zone_type_combo.setCurrentIndex(1)  # secondary за замовчуванням
+        type_row.addWidget(self.zone_type_combo)
+        left_layout.addLayout(type_row)
+
         self.zone_enabled_cb = QCheckBox("Увімкнена")
         self.zone_enabled_cb.setChecked(True)
         left_layout.addWidget(self.zone_enabled_cb)
@@ -191,13 +177,17 @@ class ZoneEditorDialog(QDialog):
         btn_new.clicked.connect(self._start_new_zone)
         left_layout.addWidget(btn_new)
 
-        btn_clear = QPushButton("🗑 Очистити поточне малювання")
-        btn_clear.clicked.connect(self.canvas.clear_points if hasattr(self, "canvas") else lambda: None)
-        left_layout.addWidget(btn_clear)
+        self.btn_clear = QPushButton("🗑 Очистити поточне малювання")
+        left_layout.addWidget(self.btn_clear)
 
         btn_delete = QPushButton("❌ Видалити вибрану зону")
         btn_delete.clicked.connect(self._delete_zone)
         left_layout.addWidget(btn_delete)
+
+        # Toggle active
+        btn_toggle = QPushButton("⏸ Увімк/Вимк вибрану зону")
+        btn_toggle.clicked.connect(self._toggle_zone)
+        left_layout.addWidget(btn_toggle)
 
         hint = QLabel(
             "💡 Ліва кнопка миші — додати точку\n"
@@ -226,24 +216,20 @@ class ZoneEditorDialog(QDialog):
         self.canvas.zone_finished.connect(self._on_zone_drawn)
         right_layout.addWidget(self.canvas)
 
-        # Тепер прив'язуємо btn_clear до реального canvas
-        btn_clear.clicked.disconnect()
-        btn_clear.clicked.connect(self.canvas.clear_points)
+        self.btn_clear.clicked.connect(self.canvas.clear_points)
 
         splitter.addWidget(right)
-        splitter.setSizes([280, 720])
-
+        splitter.setSizes([300, 750])
         main.addWidget(splitter)
-
-        if self._current_frame is not None:
-            self.canvas.set_frame(self._current_frame)
 
     def _refresh_list(self):
         self.zone_list.clear()
         for zone in self._zones:
             status = "✅" if zone.get("enabled", True) else "⛔"
+            zone_type = zone.get("zone_type", "secondary")
+            type_label = ZONE_TYPES.get(zone_type, {}).get("label", "")
             pts = len(zone.get("points", []))
-            item = QListWidgetItem(f"{status} {zone['name']}  ({pts} точок)")
+            item = QListWidgetItem(f"{status} {zone['name']}  [{type_label}]  ({pts} точок)")
             self.zone_list.addItem(item)
 
     def _on_zone_selected(self, row: int):
@@ -251,7 +237,10 @@ class ZoneEditorDialog(QDialog):
             zone = self._zones[row]
             self.zone_name_edit.setText(zone.get("name", ""))
             self.zone_enabled_cb.setChecked(zone.get("enabled", True))
-            # Відобразити зону на кадрі
+            zone_type = zone.get("zone_type", "secondary")
+            idx = self.zone_type_combo.findData(zone_type)
+            if idx >= 0:
+                self.zone_type_combo.setCurrentIndex(idx)
             self._draw_zone_preview(zone)
 
     def _draw_zone_preview(self, zone: dict):
@@ -264,15 +253,18 @@ class ZoneEditorDialog(QDialog):
         self.canvas.set_frame(frame_copy)
 
     def _start_new_zone(self):
-        name = self.zone_name_edit.text().strip() or f"Зона {len(self._zones)+1}"
-        self._pending_name = name
+        self._pending_name = self.zone_name_edit.text().strip() or f"Зона {len(self._zones)+1}"
         self._pending_enabled = self.zone_enabled_cb.isChecked()
+        self._pending_type = self.zone_type_combo.currentData() or "secondary"
         self.canvas.start_drawing()
 
     def _on_zone_drawn(self, points: list[list[int]]):
-        name = getattr(self, "_pending_name", f"Зона {len(self._zones)+1}")
-        enabled = getattr(self, "_pending_enabled", True)
-        new_zone = {"name": name, "points": points, "enabled": enabled}
+        new_zone = {
+            "name": self._pending_name,
+            "points": points,
+            "enabled": self._pending_enabled,
+            "zone_type": self._pending_type,
+        }
         self._zones.append(new_zone)
         self._refresh_list()
         self.zone_list.setCurrentRow(len(self._zones) - 1)
@@ -283,9 +275,7 @@ class ZoneEditorDialog(QDialog):
             return
         name = self._zones[row]["name"]
         reply = QMessageBox.question(
-            self,
-            "Підтвердження",
-            f"Видалити зону «{name}»?",
+            self, "Підтвердження", f"Видалити зону «{name}»?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
@@ -293,6 +283,13 @@ class ZoneEditorDialog(QDialog):
             self._refresh_list()
             if self._current_frame is not None:
                 self.canvas.set_frame(self._current_frame)
+
+    def _toggle_zone(self):
+        row = self.zone_list.currentRow()
+        if 0 <= row < len(self._zones):
+            self._zones[row]["enabled"] = not self._zones[row].get("enabled", True)
+            self._refresh_list()
+            self.zone_list.setCurrentRow(row)
 
     def _save_and_close(self):
         save_zones(self._zones)

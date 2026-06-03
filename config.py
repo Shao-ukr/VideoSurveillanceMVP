@@ -15,20 +15,23 @@ DB_PATH = "events.db"
 ZONES_FILE = "zones.json"
 
 APP_NAME = "VisionGuard AI"
-APP_VERSION = "1.1"
+APP_VERSION = "2.0"
 
 CLASS_COLORS = {
-    "person": (0, 255, 0),
-    "car": (255, 0, 0),
-    "bicycle": (0, 255, 255),
-    "truck": (255, 128, 0),
+    "person":     (0, 255, 0),
+    "car":        (255, 0, 0),
+    "bicycle":    (0, 255, 255),
+    "truck":      (255, 128, 0),
     "motorcycle": (255, 0, 255),
-    "default": (0, 255, 0),
+    "default":    (0, 255, 0),
 }
 
 TELEGRAM_BOT_TOKEN = "8854057150:AAFgD-vSYJaE4kotJu9iCSZVoBNsXT47Eck"
 CHAT_ID = "465149755"
 
 # Якщо True — детектувати тільки об'єкти всередині зон.
-# Якщо False — детектувати по всьому кадру (ігнорувати зони для фільтрації).
+# Якщо False — детектувати по всьому кадру.
 ZONE_FILTER_ENABLED = True
+
+# Папка для збереження кадрів подій
+EVENTS_DIR = "events"

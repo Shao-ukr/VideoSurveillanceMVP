@@ -8,12 +8,6 @@ ALLOWED_VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mkv', '.mov')
 
 
 def get_video_capture(source=0):
-    """
-    Відкриває тільки локальні джерела:
-      - вебкамера: 0, 1, 2...
-      - фото: .jpg, .jpeg, .png
-      - відео: .mp4, .avi, .mkv, .mov
-    """
     if isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
         cap = cv2.VideoCapture(int(source))
         if not cap.isOpened():
@@ -26,7 +20,7 @@ def get_video_capture(source=0):
     source_lower = source_path.lower()
 
     if source_lower.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
-        raise ValueError("Дозволені тільки локальні джерела: вебкамера або файли .jpg/.jpeg/.png/.mp4/.avi/.mkv/.mov")
+        raise ValueError("Дозволені тільки локальні джерела")
 
     if not os.path.exists(source_path):
         raise FileNotFoundError(f"Файл не знайдено: {source_path}")
@@ -47,14 +41,10 @@ def get_video_capture(source=0):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         return cap
 
-    raise ValueError(f"Непідтримуваний формат. Дозволено: .jpg, .jpeg, .png, .mp4, .avi або вебкамера")
+    raise ValueError(f"Непідтримуваний формат: {ext}")
 
 
 def read_frame(cap):
-    """
-    Синхронне читання кадру.
-    Повертає кадр або None при завершенні потоку.
-    """
     if cap is None:
         return None
     if isinstance(cap, np.ndarray):
