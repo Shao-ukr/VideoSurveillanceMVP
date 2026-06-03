@@ -1,0 +1,2587 @@
+﻿
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\camera.py ====================
+
+# camera.py — Відкриття джерел відео
+import os
+import cv2
+import numpy as np
+
+ALLOWED_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+ALLOWED_VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mkv', '.mov')
+
+
+def get_video_capture(source=0):
+    """
+    Відкриває тільки локальні джерела:
+      - вебкамера: 0, 1, 2...
+      - фото: .jpg, .jpeg, .png
+      - відео: .mp4, .avi, .mkv, .mov
+    """
+    if isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
+        cap = cv2.VideoCapture(int(source))
+        if not cap.isOpened():
+            raise ValueError(f"Не вдалося відкрити вебкамеру: {source}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return cap
+
+    source_path = str(source)
+    source_lower = source_path.lower()
+
+    if source_lower.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
+        raise ValueError("Дозволені тільки локальні джерела: вебкамера або файли .jpg/.jpeg/.png/.mp4/.avi/.mkv/.mov")
+
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Файл не знайдено: {source_path}")
+
+    _, ext = os.path.splitext(source_lower)
+
+    if ext in ALLOWED_IMAGE_EXTENSIONS:
+        frame = cv2.imread(source_path)
+        if frame is None or frame.size == 0:
+            raise ValueError(f"Не вдалося прочитати зображення: {source_path}")
+        return frame
+
+    if ext in ALLOWED_VIDEO_EXTENSIONS:
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            raise ValueError(f"Не вдалося відкрити відеофайл: {source_path}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return cap
+
+    raise ValueError(f"Непідтримуваний формат. Дозволено: .jpg, .jpeg, .png, .mp4, .avi або вебкамера")
+
+
+def read_frame(cap):
+    """
+    Синхронне читання кадру.
+    Повертає кадр або None при завершенні потоку.
+    """
+    if cap is None:
+        return None
+    if isinstance(cap, np.ndarray):
+        return cap if cap.size > 0 else None
+    ret, frame = cap.read()
+    if not ret or frame is None or frame.size == 0:
+        return None
+    return frame
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\config.py ====================
+
+# config.py
+
+CAMERA_SOURCE = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+MODEL_PATH = "yolov8s.pt"
+
+ALERT_CLASSES = ["person", "car", "bicycle", "truck", "motorcycle"]
+
+DETECTION_CONFIDENCE_THRESHOLD = 0.25
+MIN_EVENT_INTERVAL = 5
+
+DB_PATH = "events.db"
+ZONES_FILE = "zones.json"
+
+APP_NAME = "VisionGuard AI"
+APP_VERSION = "1.1"
+
+CLASS_COLORS = {
+    "person": (0, 255, 0),
+    "car": (255, 0, 0),
+    "bicycle": (0, 255, 255),
+    "truck": (255, 128, 0),
+    "motorcycle": (255, 0, 255),
+    "default": (0, 255, 0),
+}
+
+TELEGRAM_BOT_TOKEN = "8854057150:AAFgD-vSYJaE4kotJu9iCSZVoBNsXT47Eck"
+CHAT_ID = "465149755"
+
+# Якщо True — детектувати тільки об'єкти всередині зон.
+# Якщо False — детектувати по всьому кадру (ігнорувати зони для фільтрації).
+ZONE_FILTER_ENABLED = True
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\db.py ====================
+
+# db.py
+import sqlite3
+import time
+import json
+from config import DB_PATH, MIN_EVENT_INTERVAL
+
+last_event_time = {}
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """
+    Створює БД та таблицю подій.
+    Якщо таблиця вже існує, перевіряє наявність потрібних колонок.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame INTEGER,
+            object_class TEXT,
+            event_type TEXT,
+            bbox TEXT,
+            confidence REAL,
+            timestamp REAL
+        )
+    """)
+
+    c.execute("PRAGMA table_info(events)")
+    existing_columns = [row["name"] for row in c.fetchall()]
+
+    if "camera_id" not in existing_columns:
+        c.execute("ALTER TABLE events ADD COLUMN camera_id TEXT DEFAULT 'CAM-01'")
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp
+        ON events(timestamp)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_object_class
+        ON events(object_class)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_camera_id
+        ON events(camera_id)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def log_event(frame, object_class, event_type, bbox, confidence, camera_id="CAM-01"):
+    """
+    Логує подію в SQLite.
+    bbox зберігається у JSON-форматі.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    timestamp = time.time()
+    bbox_json = json.dumps(bbox, ensure_ascii=False)
+
+    c.execute("""
+        INSERT INTO events (
+            frame,
+            object_class,
+            event_type,
+            bbox,
+            confidence,
+            timestamp,
+            camera_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        frame,
+        object_class,
+        event_type,
+        bbox_json,
+        confidence,
+        timestamp,
+        camera_id,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def can_send_event(object_class, interval=None):
+    """
+    Антифлуд-фільтр.
+    Не дозволяє занадто часто логувати й надсилати одну й ту саму подію.
+    """
+    threshold = interval if interval is not None else MIN_EVENT_INTERVAL
+    now = time.time()
+
+    last_time = last_event_time.get(object_class, 0)
+
+    if now - last_time >= threshold:
+        last_event_time[object_class] = now
+        return True
+
+    return False
+
+
+def get_events(
+    limit=200,
+    object_class_filter=None,
+    event_type_filter=None,
+    min_confidence=0.0,
+    date_from=None,
+    date_to=None,
+    camera_id_filter=None,
+):
+    """
+    Повертає список подій з фільтрацією.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    query = "SELECT * FROM events WHERE 1=1"
+    params = []
+
+    if object_class_filter:
+        query += " AND object_class = ?"
+        params.append(object_class_filter)
+
+    if event_type_filter:
+        query += " AND event_type LIKE ?"
+        params.append(f"%{event_type_filter}%")
+
+    if min_confidence > 0.0:
+        query += " AND confidence >= ?"
+        params.append(min_confidence)
+
+    if date_from is not None:
+        query += " AND timestamp >= ?"
+        params.append(date_from)
+
+    if date_to is not None:
+        query += " AND timestamp <= ?"
+        params.append(date_to)
+
+    if camera_id_filter:
+        query += " AND camera_id = ?"
+        params.append(camera_id_filter)
+
+    query += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    c.execute(query, params)
+    rows = [dict(row) for row in c.fetchall()]
+
+    conn.close()
+    return rows
+
+
+def get_stats():
+    """
+    Повертає статистику подій.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    now = time.time()
+
+    c.execute("SELECT COUNT(*) FROM events")
+    total = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?", (now - 3600,))
+    last_hour = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?", (now - 86400,))
+    last_day = c.fetchone()[0]
+
+    c.execute("""
+        SELECT object_class, COUNT(*) AS cnt
+        FROM events
+        GROUP BY object_class
+        ORDER BY cnt DESC
+    """)
+    by_class = {row[0]: row[1] for row in c.fetchall()}
+
+    conn.close()
+
+    return {
+        "total": total,
+        "last_hour": last_hour,
+        "last_day": last_day,
+        "by_class": by_class,
+    }
+
+
+def delete_event(event_id):
+    """
+    Видаляє одну подію за ID.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("DELETE FROM events WHERE id = ?", (event_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def clear_all_events():
+    """
+    Очищає всі події з БД.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("DELETE FROM events")
+
+    conn.commit()
+    conn.close()
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\detector.py ====================
+
+# detector.py
+from ultralytics import YOLO
+from config import MODEL_PATH, ALERT_CLASSES, DETECTION_CONFIDENCE_THRESHOLD
+
+model = YOLO(MODEL_PATH)
+
+try:
+    model.to("cpu")
+except Exception:
+    pass
+
+
+def detect_objects(frame, confidence_threshold=None):
+    """
+    Детекція об'єктів на кадрі.
+    """
+    if frame is None:
+        return []
+
+    threshold = (
+        confidence_threshold
+        if confidence_threshold is not None
+        else DETECTION_CONFIDENCE_THRESHOLD
+    )
+
+    results = model.predict(
+        frame,
+        verbose=False,
+        device="cpu"
+    )[0]
+
+    detected_objects = []
+
+    if results.boxes is None:
+        return detected_objects
+
+    for box, cls, conf in zip(
+        results.boxes.xyxy,
+        results.boxes.cls,
+        results.boxes.conf
+    ):
+        class_id = int(cls.item()) if hasattr(cls, "item") else int(cls)
+        confidence = float(conf.item()) if hasattr(conf, "item") else float(conf)
+
+        class_name = model.names[class_id]
+
+        if class_name not in ALERT_CLASSES:
+            continue
+
+        if confidence < threshold:
+            continue
+
+        bbox = [int(x) for x in box.tolist()]
+
+        detected_objects.append({
+            "class": class_id,
+            "name": class_name,
+            "confidence": confidence,
+            "bbox": bbox,
+        })
+
+    return detected_objects
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\events.py ====================
+
+# events.py
+from config import ALERT_CLASSES, DETECTION_CONFIDENCE_THRESHOLD, ZONE_FILTER_ENABLED
+from notifications import send_telegram_message
+from db import log_event, can_send_event
+from zones import bbox_intersects_any_zone
+
+
+EVENT_TYPE_MAP = {
+    "person": "Людина у кадрі",
+    "car": "Автомобіль у кадрі",
+    "bicycle": "Велосипед у кадрі",
+    "truck": "Вантажівка у кадрі",
+    "motorcycle": "Мотоцикл у кадрі",
+}
+
+
+def get_event_type(object_name: str) -> str:
+    """Перетворює клас YOLO у зрозумілий тип події."""
+    return EVENT_TYPE_MAP.get(
+        object_name,
+        f"Виявлено об'єкт: {object_name}"
+    )
+
+
+def generate_events(
+    objects: list,
+    frame_number: int,
+    camera_id: str = "CAM-01",
+    confidence_threshold: float | None = None,
+    event_interval: float | None = None,
+    send_notifications: bool = True,
+    zones: list | None = None,
+) -> list[dict]:
+    """
+    Генерує події для виявлених об'єктів.
+
+    Якщо zones передані та ZONE_FILTER_ENABLED=True —
+    враховуються тільки об'єкти всередині зон.
+    """
+    threshold = (
+        confidence_threshold
+        if confidence_threshold is not None
+        else DETECTION_CONFIDENCE_THRESHOLD
+    )
+
+    active_zones = zones if zones else []
+    use_zones = ZONE_FILTER_ENABLED and len(active_zones) > 0
+
+    events = []
+
+    for obj in objects:
+        object_name = obj.get("name")
+        confidence = float(obj.get("confidence", 0))
+        bbox = obj.get("bbox", [])
+
+        if object_name not in ALERT_CLASSES:
+            continue
+
+        if confidence < threshold:
+            continue
+
+        # Перевірка зон
+        zone_name = None
+        if use_zones:
+            in_zone, zone_name = bbox_intersects_any_zone(bbox, active_zones)
+            if not in_zone:
+                continue  # об'єкт поза зоною — пропустити
+
+        cooldown_key = f"{camera_id}:{object_name}"
+
+        if not can_send_event(cooldown_key, interval=event_interval):
+            continue
+
+        event_type = get_event_type(object_name)
+
+        # Додаємо назву зони до типу події якщо є
+        if zone_name:
+            event_type = f"{event_type} [{zone_name}]"
+
+        event = {
+            "frame": frame_number,
+            "object_class": object_name,
+            "bbox": bbox,
+            "confidence": confidence,
+            "event_type": event_type,
+            "camera_id": camera_id,
+            "zone_name": zone_name,
+        }
+
+        events.append(event)
+
+        log_event(
+            frame=frame_number,
+            object_class=object_name,
+            event_type=event_type,
+            bbox=bbox,
+            confidence=confidence,
+            camera_id=camera_id,
+        )
+
+        if send_notifications:
+            zone_info = f"\nЗона: {zone_name}" if zone_name else ""
+            message = (
+                f"🔔 {event_type}\n"
+                f"Камера: {camera_id} | Кадр: {frame_number}{zone_info}\n"
+                f"Впевненість: {confidence:.0%}"
+            )
+            send_telegram_message(message)
+
+    return events
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\gui.py ====================
+
+# gui.py — VisionGuard AI — оновлений GUI з підтримкою зон
+import sys
+import cv2
+import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QPushButton,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QFileDialog,
+    QTextEdit,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QTabWidget,
+    QLineEdit,
+    QGroupBox,
+    QFormLayout,
+    QSlider,
+    QCheckBox,
+    QSizePolicy,
+)
+from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtCore import Qt, QTimer
+
+from camera import get_video_capture, read_frame
+from preprocessing import preprocess_frame
+from detector import detect_objects
+from events import generate_events
+from db import init_db, get_events, get_stats, delete_event, clear_all_events
+from notifications import send_telegram_message
+from zones import load_zones, draw_zones_on_frame
+
+try:
+    from config import APP_NAME, APP_VERSION
+except ImportError:
+    APP_NAME = "VisionGuard AI"
+    APP_VERSION = "1.1"
+
+try:
+    from config import CLASS_COLORS
+except ImportError:
+    CLASS_COLORS = {"person": (0, 255, 0), "car": (255, 0, 0), "default": (0, 255, 255)}
+
+try:
+    from config import DETECTION_CONFIDENCE_THRESHOLD
+except ImportError:
+    DETECTION_CONFIDENCE_THRESHOLD = 0.25
+
+try:
+    from config import MIN_EVENT_INTERVAL
+except ImportError:
+    MIN_EVENT_INTERVAL = 5
+
+try:
+    from config import ZONE_FILTER_ENABLED
+except ImportError:
+    ZONE_FILTER_ENABLED = True
+
+
+# ─────────────────────────────────────────────────────────────
+# VideoPanel
+# ─────────────────────────────────────────────────────────────
+
+class VideoPanel(QLabel):
+    """Панель відображення відео з накладенням bounding boxes і зон."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(640, 480)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText("Відеопотік не запущено")
+        self.setStyleSheet("""
+            QLabel {
+                background-color: #111;
+                color: #666;
+                border: 1px solid #333;
+                font-size: 16px;
+            }
+        """)
+
+    def set_frame(
+        self,
+        frame_bgr,
+        objects=None,
+        zones=None,
+        model_size=(640, 640),
+        show_zones: bool = True,
+    ):
+        if frame_bgr is None or frame_bgr.size == 0:
+            return
+
+        frame_draw = frame_bgr.copy()
+        h, w = frame_draw.shape[:2]
+
+        # Малюємо зони
+        if show_zones and zones:
+            frame_draw = draw_zones_on_frame(
+                frame_draw, zones, w, h,
+                original_w=model_size[0],
+                original_h=model_size[1],
+            )
+
+        # Малюємо bounding boxes
+        if objects:
+            self._draw_boxes(frame_draw, objects, model_size)
+
+        frame_rgb = cv2.cvtColor(frame_draw, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img).scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.setPixmap(pixmap)
+
+    def _draw_boxes(self, frame, objects, model_size=(640, 640)):
+        frame_h, frame_w = frame.shape[:2]
+        model_w, model_h = model_size
+        scale_x = frame_w / model_w
+        scale_y = frame_h / model_h
+
+        for obj in objects:
+            bbox = obj.get("bbox", [])
+            if len(bbox) != 4:
+                continue
+
+            x1, y1, x2, y2 = bbox
+            x1 = max(0, min(int(x1 * scale_x), frame_w - 1))
+            y1 = max(0, min(int(y1 * scale_y), frame_h - 1))
+            x2 = max(0, min(int(x2 * scale_x), frame_w - 1))
+            y2 = max(0, min(int(y2 * scale_y), frame_h - 1))
+
+            class_name = obj.get("name", "object")
+            confidence = float(obj.get("confidence", 0))
+            color = CLASS_COLORS.get(class_name, CLASS_COLORS.get("default", (0, 255, 255)))
+
+            label = f"{class_name}: {confidence:.2f}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            tw, th = text_size
+            cv2.rectangle(frame, (x1, max(y1 - th - 8, 0)), (x1 + tw + 8, y1), color, -1)
+            cv2.putText(
+                frame, label,
+                (x1 + 4, max(y1 - 4, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+            )
+
+
+# ─────────────────────────────────────────────────────────────
+# Main Window
+# ─────────────────────────────────────────────────────────────
+
+class VisionGuardGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        init_db()
+
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1360, 820)
+
+        # Стан
+        self.cap = None
+        self.frame_number = 0
+        self.single_image_mode = False
+        self.model_frame_size = (640, 640)
+        self.fps_counter = 0
+        self._last_frame = None  # для zone editor
+
+        # Динамічні налаштування
+        self._confidence = DETECTION_CONFIDENCE_THRESHOLD
+        self._event_interval = float(MIN_EVENT_INTERVAL)
+        self._zone_filter_on = ZONE_FILTER_ENABLED
+        self._show_zones = True
+
+        # Зони
+        self.zones: list[dict] = load_zones()
+
+        # Вкладки
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        self.live_tab = QWidget()
+        self.events_tab = QWidget()
+        self.stats_tab = QWidget()
+        self.settings_tab = QWidget()
+
+        self.tabs.addTab(self.live_tab, "📹 Live Video")
+        self.tabs.addTab(self.events_tab, "📋 Події")
+        self.tabs.addTab(self.stats_tab, "📊 Статистика")
+        self.tabs.addTab(self.settings_tab, "⚙️ Налаштування")
+
+        self._build_live_tab()
+        self._build_events_tab()
+        self._build_stats_tab()
+        self._build_settings_tab()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+
+        self.fps_timer = QTimer()
+        self.fps_timer.timeout.connect(self._update_fps_title)
+        self.fps_timer.start(1000)
+
+        self.refresh_event_table()
+        self.refresh_stats()
+
+    # ─── Live Tab ───────────────────────────────────────────
+
+    def _build_live_tab(self):
+        layout = QVBoxLayout(self.live_tab)
+
+        # Кнопки управління
+        ctrl = QHBoxLayout()
+
+        self.btn_camera = QPushButton("▶ Запустити камеру")
+        self.btn_camera.clicked.connect(self.start_camera)
+        ctrl.addWidget(self.btn_camera)
+
+        self.btn_file = QPushButton("📂 Завантажити відео/кадр")
+        self.btn_file.clicked.connect(self.load_file)
+        ctrl.addWidget(self.btn_file)
+
+        self.btn_stop = QPushButton("⏹ Зупинити")
+        self.btn_stop.clicked.connect(self.stop_stream)
+        ctrl.addWidget(self.btn_stop)
+
+        self.btn_zones = QPushButton("🗺 Налаштувати зони")
+        self.btn_zones.setStyleSheet("background: #1a6ba0; color: white; font-weight: bold;")
+        self.btn_zones.clicked.connect(self.open_zone_editor)
+        ctrl.addWidget(self.btn_zones)
+
+        self.chk_show_zones = QCheckBox("Показувати зони")
+        self.chk_show_zones.setChecked(True)
+        self.chk_show_zones.stateChanged.connect(
+            lambda s: setattr(self, "_show_zones", bool(s))
+        )
+        ctrl.addWidget(self.chk_show_zones)
+
+        layout.addLayout(ctrl)
+
+        # Статус зон
+        self.zone_status_label = QLabel()
+        self._update_zone_status_label()
+        self.zone_status_label.setStyleSheet("color: #4af; font-size: 12px; padding: 2px 4px;")
+        layout.addWidget(self.zone_status_label)
+
+        # Відео
+        self.video_panel = VideoPanel()
+        layout.addWidget(self.video_panel, stretch=4)
+
+        # Лог
+        self.live_log = QTextEdit()
+        self.live_log.setReadOnly(True)
+        self.live_log.setMaximumHeight(140)
+        layout.addWidget(self.live_log, stretch=1)
+
+    def _update_zone_status_label(self):
+        active = [z for z in self.zones if z.get("enabled", True)]
+        if self.zones:
+            names = ", ".join(z["name"] for z in active) or "—"
+            self.zone_status_label.setText(
+                f"Зони ({len(active)}/{len(self.zones)} активних): {names}"
+            )
+        else:
+            self.zone_status_label.setText("Зони не налаштовано — детекція по всьому кадру")
+
+    def append_log(self, message: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.live_log.append(f"[{ts}] {message}")
+        sb = self.live_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def start_camera(self):
+        try:
+            self._release()
+            self.cap = get_video_capture(0)
+            self.frame_number = 0
+            self.single_image_mode = False
+            self.append_log("Камеру запущено")
+            self.timer.start(30)
+        except Exception as e:
+            self.append_log(f"Помилка підключення камери: {e}")
+
+    def load_file(self):
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Відкрити відео або кадр", "",
+                "Media Files (*.jpg *.jpeg *.png *.mp4 *.avi *.mkv *.mov)"
+            )
+            if not path:
+                return
+            self._release()
+            self.cap = get_video_capture(path)
+            self.single_image_mode = path.lower().endswith((".jpg", ".jpeg", ".png"))
+            self.frame_number = 0
+            self.append_log(f"Файл завантажено: {path}")
+            self.timer.start(30)
+        except Exception as e:
+            self.append_log(f"Помилка завантаження файлу: {e}")
+
+    def stop_stream(self):
+        self._release()
+        self.append_log("Потік зупинено")
+
+    def _release(self):
+        self.timer.stop()
+        if self.cap is not None and hasattr(self.cap, "release"):
+            self.cap.release()
+        self.cap = None
+        self.single_image_mode = False
+
+    def update_frame(self):
+        if self.cap is None:
+            return
+
+        frame = read_frame(self.cap)
+        if frame is None:
+            self.timer.stop()
+            self.append_log("Кадр недоступний або потік завершено")
+            return
+
+        self._last_frame = frame.copy()
+
+        frame_proc = preprocess_frame(frame, size=self.model_frame_size)
+        if frame_proc is None:
+            self.timer.stop()
+            self.append_log("Кадр не може бути оброблений")
+            return
+
+        objects = detect_objects(frame_proc, confidence_threshold=self._confidence)
+
+        events = generate_events(
+            objects,
+            self.frame_number,
+            confidence_threshold=self._confidence,
+            event_interval=self._event_interval,
+            zones=self.zones if self._zone_filter_on else [],
+        )
+
+        self.video_panel.set_frame(
+            frame,
+            objects,
+            zones=self.zones if self._show_zones else None,
+            model_size=self.model_frame_size,
+        )
+
+        self.fps_counter += 1
+
+        if events:
+            for ev in events:
+                zone_info = f" | Зона: {ev['zone_name']}" if ev.get("zone_name") else ""
+                self.append_log(
+                    f"🔔 {ev['event_type']} | {ev['object_class']} "
+                    f"| {ev['confidence']:.0%}{zone_info}"
+                )
+            self.refresh_event_table()
+            self.refresh_stats()
+        elif self.frame_number % 60 == 0:
+            self.append_log(f"Кадр {self.frame_number}: подій не виявлено")
+
+        self.frame_number += 1
+
+        if self.single_image_mode:
+            self.timer.stop()
+
+    def _update_fps_title(self):
+        self.setWindowTitle(
+            f"{APP_NAME} v{APP_VERSION}  |  FPS: {self.fps_counter}"
+        )
+        self.fps_counter = 0
+
+    def open_zone_editor(self):
+        from zone_editor import ZoneEditorDialog
+        dlg = ZoneEditorDialog(self, current_frame=self._last_frame)
+        dlg.zones_updated.connect(self._on_zones_updated)
+        dlg.exec_()
+
+    def _on_zones_updated(self, zones: list[dict]):
+        self.zones = zones
+        self._update_zone_status_label()
+        self.append_log(f"Зони оновлено: {len(zones)} зон збережено")
+
+    # ─── Events Tab ─────────────────────────────────────────
+
+    def _build_events_tab(self):
+        layout = QVBoxLayout(self.events_tab)
+
+        btn_row = QHBoxLayout()
+
+        btn_refresh = QPushButton("🔄 Оновити")
+        btn_refresh.clicked.connect(self.refresh_event_table)
+        btn_row.addWidget(btn_refresh)
+
+        btn_delete = QPushButton("🗑 Видалити вибрану")
+        btn_delete.clicked.connect(self._delete_selected_event)
+        btn_row.addWidget(btn_delete)
+
+        btn_clear = QPushButton("❌ Очистити всі")
+        btn_clear.clicked.connect(self._clear_events)
+        btn_row.addWidget(btn_clear)
+
+        layout.addLayout(btn_row)
+
+        self.event_table = QTableWidget()
+        self.event_table.setColumnCount(7)
+        self.event_table.setHorizontalHeaderLabels([
+            "ID", "Час", "Клас", "Тип події", "Впевненість", "Кадр", "Камера"
+        ])
+        self.event_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.event_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.event_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.event_table.setAlternatingRowColors(True)
+        layout.addWidget(self.event_table)
+
+    def refresh_event_table(self):
+        events = get_events(limit=300)
+        self.event_table.setRowCount(len(events))
+        for row, ev in enumerate(events):
+            ts = ev.get("timestamp", 0)
+            try:
+                time_text = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                time_text = ""
+            self.event_table.setItem(row, 0, QTableWidgetItem(str(ev.get("id", ""))))
+            self.event_table.setItem(row, 1, QTableWidgetItem(time_text))
+            self.event_table.setItem(row, 2, QTableWidgetItem(str(ev.get("object_class", ""))))
+            self.event_table.setItem(row, 3, QTableWidgetItem(str(ev.get("event_type", ""))))
+            self.event_table.setItem(row, 4, QTableWidgetItem(f"{float(ev.get('confidence', 0)):.0%}"))
+            self.event_table.setItem(row, 5, QTableWidgetItem(str(ev.get("frame", ""))))
+            self.event_table.setItem(row, 6, QTableWidgetItem(str(ev.get("camera_id", ""))))
+
+    def _delete_selected_event(self):
+        rows = self.event_table.selectionModel().selectedRows()
+        if not rows:
+            self.append_log("Виберіть подію для видалення")
+            return
+        item = self.event_table.item(rows[0].row(), 0)
+        if item:
+            delete_event(int(item.text()))
+            self.refresh_event_table()
+            self.refresh_stats()
+
+    def _clear_events(self):
+        clear_all_events()
+        self.append_log("Усі події очищено")
+        self.refresh_event_table()
+        self.refresh_stats()
+
+    # ─── Stats Tab ──────────────────────────────────────────
+
+    def _build_stats_tab(self):
+        layout = QVBoxLayout(self.stats_tab)
+
+        btn_refresh = QPushButton("🔄 Оновити статистику")
+        btn_refresh.clicked.connect(self.refresh_stats)
+        layout.addWidget(btn_refresh)
+
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        font = QFont("Courier New", 11)
+        self.stats_text.setFont(font)
+        layout.addWidget(self.stats_text)
+
+    def refresh_stats(self):
+        stats = get_stats()
+        total = stats.get("total", 0)
+        last_hour = stats.get("last_hour", 0)
+        last_day = stats.get("last_day", 0)
+        by_class = stats.get("by_class", {})
+
+        lines = [
+            f"{'─' * 40}",
+            f"  VisionGuard AI — Статистика подій",
+            f"{'─' * 40}",
+            f"  Усього подій:         {total}",
+            f"  За останню годину:    {last_hour}",
+            f"  За останню добу:      {last_day}",
+            f"{'─' * 40}",
+            "  За класами об'єктів:",
+            "",
+        ]
+
+        if by_class:
+            max_count = max(by_class.values()) or 1
+            bar_width = 25
+            for cls, cnt in by_class.items():
+                bar = "█" * int(cnt / max_count * bar_width)
+                lines.append(f"  {cls:<12} {bar:<{bar_width}} {cnt}")
+        else:
+            lines.append("  — немає даних —")
+
+        lines.append(f"{'─' * 40}")
+
+        # Зони
+        lines.append(f"  Активних зон: {len([z for z in self.zones if z.get('enabled', True)])}/{len(self.zones)}")
+        if self.zones:
+            for z in self.zones:
+                status = "✅" if z.get("enabled", True) else "⛔"
+                pts = len(z.get("points", []))
+                lines.append(f"  {status} {z['name']}  ({pts} точок)")
+        lines.append(f"{'─' * 40}")
+
+        self.stats_text.setText("\n".join(lines))
+
+    # ─── Settings Tab ───────────────────────────────────────
+
+    def _build_settings_tab(self):
+        layout = QVBoxLayout(self.settings_tab)
+
+        # Детекція
+        det_group = QGroupBox("Параметри детекції")
+        det_layout = QFormLayout()
+
+        # Confidence slider
+        conf_row = QHBoxLayout()
+        self.slider_conf = QSlider(Qt.Horizontal)
+        self.slider_conf.setRange(5, 95)
+        self.slider_conf.setValue(int(self._confidence * 100))
+        self.slider_conf.setTickInterval(5)
+        self.slider_conf.setTickPosition(QSlider.TicksBelow)
+        self.lbl_conf_val = QLabel(f"{self._confidence:.2f}")
+        self.slider_conf.valueChanged.connect(self._on_conf_changed)
+        conf_row.addWidget(self.slider_conf)
+        conf_row.addWidget(self.lbl_conf_val)
+        det_layout.addRow("Поріг впевненості:", conf_row)
+
+        # Interval slider
+        interval_row = QHBoxLayout()
+        self.slider_interval = QSlider(Qt.Horizontal)
+        self.slider_interval.setRange(1, 60)
+        self.slider_interval.setValue(int(self._event_interval))
+        self.slider_interval.setTickInterval(5)
+        self.slider_interval.setTickPosition(QSlider.TicksBelow)
+        self.lbl_interval_val = QLabel(f"{int(self._event_interval)} с")
+        self.slider_interval.valueChanged.connect(self._on_interval_changed)
+        interval_row.addWidget(self.slider_interval)
+        interval_row.addWidget(self.lbl_interval_val)
+        det_layout.addRow("Мін. інтервал подій:", interval_row)
+
+        det_group.setLayout(det_layout)
+        layout.addWidget(det_group)
+
+        # Зони
+        zone_group = QGroupBox("Налаштування зон")
+        zone_layout = QVBoxLayout()
+
+        self.chk_zone_filter = QCheckBox("Фільтрувати події по зонах (тільки об'єкти у зоні)")
+        self.chk_zone_filter.setChecked(self._zone_filter_on)
+        self.chk_zone_filter.stateChanged.connect(
+            lambda s: setattr(self, "_zone_filter_on", bool(s))
+        )
+        zone_layout.addWidget(self.chk_zone_filter)
+
+        btn_open_editor = QPushButton("🗺 Відкрити редактор зон")
+        btn_open_editor.setStyleSheet("background: #1a6ba0; color: white; font-weight: bold; padding: 6px;")
+        btn_open_editor.clicked.connect(self.open_zone_editor)
+        zone_layout.addWidget(btn_open_editor)
+
+        zone_group.setLayout(zone_layout)
+        layout.addWidget(zone_group)
+
+        # Telegram
+        tg_group = QGroupBox("Telegram")
+        tg_layout = QVBoxLayout()
+
+        self.tg_token = QLineEdit()
+        self.tg_token.setPlaceholderText("Bot Token (якщо вже є у config.py — залиш порожнім)")
+        self.tg_token.setEchoMode(QLineEdit.Password)
+        self.tg_chat = QLineEdit()
+        self.tg_chat.setPlaceholderText("Chat ID (якщо вже є у config.py — залиш порожнім)")
+
+        btn_test_tg = QPushButton("📨 Надіслати тестове повідомлення")
+        btn_test_tg.clicked.connect(self._send_test_telegram)
+
+        tg_layout.addWidget(self.tg_token)
+        tg_layout.addWidget(self.tg_chat)
+        tg_layout.addWidget(btn_test_tg)
+        tg_group.setLayout(tg_layout)
+        layout.addWidget(tg_group)
+
+        layout.addStretch()
+
+    def _on_conf_changed(self, value: int):
+        self._confidence = value / 100.0
+        self.lbl_conf_val.setText(f"{self._confidence:.2f}")
+
+    def _on_interval_changed(self, value: int):
+        self._event_interval = float(value)
+        self.lbl_interval_val.setText(f"{value} с")
+
+    def _send_test_telegram(self):
+        try:
+            ok = send_telegram_message("🔔 Тестове повідомлення від VisionGuard AI")
+            self.append_log("Telegram: повідомлення надіслано" if ok else "Telegram: помилка надсилання")
+        except Exception as e:
+            self.append_log(f"Telegram: {e}")
+
+    def closeEvent(self, event):
+        self._release()
+        event.accept()
+
+
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = VisionGuardGUI()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\main.py ====================
+
+# main.py
+import sys
+from PyQt5.QtWidgets import QApplication
+from gui import VisionGuardGUI  # <-- тут правильна назва класу
+
+def main():
+    app = QApplication(sys.argv)
+    window = VisionGuardGUI()  # <-- замінити VideoSurveillanceGUI на VisionGuardGUI
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\notifications.py ====================
+
+import urllib.parse
+import urllib.request
+
+
+try:
+    from config import TELEGRAM_BOT_TOKEN, CHAT_ID
+except ImportError:
+    try:
+        from config import BOT_TOKEN as TELEGRAM_BOT_TOKEN, CHAT_ID
+    except ImportError:
+        TELEGRAM_BOT_TOKEN = None
+        CHAT_ID = None
+
+
+def send_telegram_message(message):
+    """
+    Синхронне надсилання Telegram-повідомлення через HTTP API.
+
+    Це прибирає проблему:
+    RuntimeWarning: coroutine 'Bot.send_message' was never awaited
+    """
+
+    try:
+        if not TELEGRAM_BOT_TOKEN or not CHAT_ID:
+            print("Telegram не налаштований: перевір TELEGRAM_BOT_TOKEN і CHAT_ID у config.py")
+            return False
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+        data = urllib.parse.urlencode({
+            "chat_id": CHAT_ID,
+            "text": message
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            url=url,
+            data=data,
+            method="POST"
+        )
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                print(f"Помилка Telegram: HTTP {response.status}")
+                return False
+
+        return True
+
+    except Exception as e:
+        print("Помилка Telegram:", e)
+        return False
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\preprocessing.py ====================
+
+import cv2
+
+
+def preprocess_frame(frame, size=(640, 640)):
+    """
+    Попередня обробка кадру:
+    - перевірка на порожній кадр;
+    - масштабування;
+    - конвертація BGR -> RGB;
+    - легке згладжування шумів.
+    """
+
+    if frame is None or frame.size == 0:
+        return None
+
+    frame_resized = cv2.resize(frame, size)
+    frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+
+    # Фільтрація шумів для стабільнішої детекції
+    frame_filtered = cv2.GaussianBlur(frame_rgb, (3, 3), 0)
+
+    return frame_filtered
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\project_code.txt ====================
+
+# camera.py вЂ” Р’С–РґРєСЂРёС‚С‚СЏ РґР¶РµСЂРµР» РІС–РґРµРѕ
+import os
+import cv2
+import numpy as np
+
+ALLOWED_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+ALLOWED_VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mkv', '.mov')
+
+
+def get_video_capture(source=0):
+    """
+    Р’С–РґРєСЂРёРІР°С” С‚С–Р»СЊРєРё Р»РѕРєР°Р»СЊРЅС– РґР¶РµСЂРµР»Р°:
+      - РІРµР±РєР°РјРµСЂР°: 0, 1, 2...
+      - С„РѕС‚Рѕ: .jpg, .jpeg, .png
+      - РІС–РґРµРѕ: .mp4, .avi, .mkv, .mov
+    """
+    if isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
+        cap = cv2.VideoCapture(int(source))
+        if not cap.isOpened():
+            raise ValueError(f"РќРµ РІРґР°Р»РѕСЃСЏ РІС–РґРєСЂРёС‚Рё РІРµР±РєР°РјРµСЂСѓ: {source}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return cap
+
+    source_path = str(source)
+    source_lower = source_path.lower()
+
+    if source_lower.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
+        raise ValueError("Р”РѕР·РІРѕР»РµРЅС– С‚С–Р»СЊРєРё Р»РѕРєР°Р»СЊРЅС– РґР¶РµСЂРµР»Р°: РІРµР±РєР°РјРµСЂР° Р°Р±Рѕ С„Р°Р№Р»Рё .jpg/.jpeg/.png/.mp4/.avi/.mkv/.mov")
+
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Р¤Р°Р№Р» РЅРµ Р·РЅР°Р№РґРµРЅРѕ: {source_path}")
+
+    _, ext = os.path.splitext(source_lower)
+
+    if ext in ALLOWED_IMAGE_EXTENSIONS:
+        frame = cv2.imread(source_path)
+        if frame is None or frame.size == 0:
+            raise ValueError(f"РќРµ РІРґР°Р»РѕСЃСЏ РїСЂРѕС‡РёС‚Р°С‚Рё Р·РѕР±СЂР°Р¶РµРЅРЅСЏ: {source_path}")
+        return frame
+
+    if ext in ALLOWED_VIDEO_EXTENSIONS:
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            raise ValueError(f"РќРµ РІРґР°Р»РѕСЃСЏ РІС–РґРєСЂРёС‚Рё РІС–РґРµРѕС„Р°Р№Р»: {source_path}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return cap
+
+    raise ValueError(f"РќРµРїС–РґС‚СЂРёРјСѓРІР°РЅРёР№ С„РѕСЂРјР°С‚. Р”РѕР·РІРѕР»РµРЅРѕ: .jpg, .jpeg, .png, .mp4, .avi Р°Р±Рѕ РІРµР±РєР°РјРµСЂР°")
+
+
+def read_frame(cap):
+    """
+    РЎРёРЅС…СЂРѕРЅРЅРµ С‡РёС‚Р°РЅРЅСЏ РєР°РґСЂСѓ.
+    РџРѕРІРµСЂС‚Р°С” РєР°РґСЂ Р°Р±Рѕ None РїСЂРё Р·Р°РІРµСЂС€РµРЅРЅС– РїРѕС‚РѕРєСѓ.
+    """
+    if cap is None:
+        return None
+    if isinstance(cap, np.ndarray):
+        return cap if cap.size > 0 else None
+    ret, frame = cap.read()
+    if not ret or frame is None or frame.size == 0:
+        return None
+    return frame
+# config.py
+
+CAMERA_SOURCE = 0
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+MODEL_PATH = "yolov8s.pt"
+
+ALERT_CLASSES = ["person", "car", "bicycle", "truck", "motorcycle"]
+
+DETECTION_CONFIDENCE_THRESHOLD = 0.25
+MIN_EVENT_INTERVAL = 5
+
+DB_PATH = "events.db"
+
+APP_NAME = "VisionGuard AI"
+APP_VERSION = "1.0"
+
+CLASS_COLORS = {
+    "person": (0, 255, 0),
+    "car": (255, 0, 0),
+    "bicycle": (0, 255, 255),
+    "truck": (255, 128, 0),
+    "motorcycle": (255, 0, 255),
+    "default": (0, 255, 0),
+}
+TELEGRAM_BOT_TOKEN = "8854057150:AAFgD-vSYJaE4kotJu9iCSZVoBNsXT47Eck"
+CHAT_ID = "465149755"
+# db.py
+import sqlite3
+import time
+import json
+from config import DB_PATH, MIN_EVENT_INTERVAL
+
+last_event_time = {}
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """
+    РЎС‚РІРѕСЂСЋС” Р‘Р” С‚Р° С‚Р°Р±Р»РёС†СЋ РїРѕРґС–Р№.
+    РЇРєС‰Рѕ С‚Р°Р±Р»РёС†СЏ РІР¶Рµ С–СЃРЅСѓС”, РїРµСЂРµРІС–СЂСЏС” РЅР°СЏРІРЅС–СЃС‚СЊ РїРѕС‚СЂС–Р±РЅРёС… РєРѕР»РѕРЅРѕРє.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame INTEGER,
+            object_class TEXT,
+            event_type TEXT,
+            bbox TEXT,
+            confidence REAL,
+            timestamp REAL
+        )
+    """)
+
+    c.execute("PRAGMA table_info(events)")
+    existing_columns = [row["name"] for row in c.fetchall()]
+
+    if "camera_id" not in existing_columns:
+        c.execute("ALTER TABLE events ADD COLUMN camera_id TEXT DEFAULT 'CAM-01'")
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_timestamp
+        ON events(timestamp)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_object_class
+        ON events(object_class)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_events_camera_id
+        ON events(camera_id)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def log_event(frame, object_class, event_type, bbox, confidence, camera_id="CAM-01"):
+    """
+    Р›РѕРіСѓС” РїРѕРґС–СЋ РІ SQLite.
+    bbox Р·Р±РµСЂС–РіР°С”С‚СЊСЃСЏ Сѓ JSON-С„РѕСЂРјР°С‚С–.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    timestamp = time.time()
+    bbox_json = json.dumps(bbox, ensure_ascii=False)
+
+    c.execute("""
+        INSERT INTO events (
+            frame,
+            object_class,
+            event_type,
+            bbox,
+            confidence,
+            timestamp,
+            camera_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        frame,
+        object_class,
+        event_type,
+        bbox_json,
+        confidence,
+        timestamp,
+        camera_id,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def can_send_event(object_class, interval=None):
+    """
+    РђРЅС‚РёС„Р»СѓРґ-С„С–Р»СЊС‚СЂ.
+    РќРµ РґРѕР·РІРѕР»СЏС” Р·Р°РЅР°РґС‚Рѕ С‡Р°СЃС‚Рѕ Р»РѕРіСѓРІР°С‚Рё Р№ РЅР°РґСЃРёР»Р°С‚Рё РѕРґРЅСѓ Р№ С‚Сѓ СЃР°РјСѓ РїРѕРґС–СЋ.
+    """
+    threshold = interval if interval is not None else MIN_EVENT_INTERVAL
+    now = time.time()
+
+    last_time = last_event_time.get(object_class, 0)
+
+    if now - last_time >= threshold:
+        last_event_time[object_class] = now
+        return True
+
+    return False
+
+
+def get_events(
+    limit=200,
+    object_class_filter=None,
+    event_type_filter=None,
+    min_confidence=0.0,
+    date_from=None,
+    date_to=None,
+    camera_id_filter=None,
+):
+    """
+    РџРѕРІРµСЂС‚Р°С” СЃРїРёСЃРѕРє РїРѕРґС–Р№ Р· С„С–Р»СЊС‚СЂР°С†С–С”СЋ.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    query = "SELECT * FROM events WHERE 1=1"
+    params = []
+
+    if object_class_filter:
+        query += " AND object_class = ?"
+        params.append(object_class_filter)
+
+    if event_type_filter:
+        query += " AND event_type LIKE ?"
+        params.append(f"%{event_type_filter}%")
+
+    if min_confidence > 0.0:
+        query += " AND confidence >= ?"
+        params.append(min_confidence)
+
+    if date_from is not None:
+        query += " AND timestamp >= ?"
+        params.append(date_from)
+
+    if date_to is not None:
+        query += " AND timestamp <= ?"
+        params.append(date_to)
+
+    if camera_id_filter:
+        query += " AND camera_id = ?"
+        params.append(camera_id_filter)
+
+    query += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    c.execute(query, params)
+    rows = [dict(row) for row in c.fetchall()]
+
+    conn.close()
+    return rows
+
+
+def get_stats():
+    """
+    РџРѕРІРµСЂС‚Р°С” СЃС‚Р°С‚РёСЃС‚РёРєСѓ РїРѕРґС–Р№.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    now = time.time()
+
+    c.execute("SELECT COUNT(*) FROM events")
+    total = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?", (now - 3600,))
+    last_hour = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?", (now - 86400,))
+    last_day = c.fetchone()[0]
+
+    c.execute("""
+        SELECT object_class, COUNT(*) AS cnt
+        FROM events
+        GROUP BY object_class
+        ORDER BY cnt DESC
+    """)
+    by_class = {row[0]: row[1] for row in c.fetchall()}
+
+    conn.close()
+
+    return {
+        "total": total,
+        "last_hour": last_hour,
+        "last_day": last_day,
+        "by_class": by_class,
+    }
+
+
+def delete_event(event_id):
+    """
+    Р’РёРґР°Р»СЏС” РѕРґРЅСѓ РїРѕРґС–СЋ Р·Р° ID.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("DELETE FROM events WHERE id = ?", (event_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def clear_all_events():
+    """
+    РћС‡РёС‰Р°С” РІСЃС– РїРѕРґС–С— Р· Р‘Р”.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("DELETE FROM events")
+
+    conn.commit()
+    conn.close()
+# detector.py
+from ultralytics import YOLO
+from config import MODEL_PATH, ALERT_CLASSES, DETECTION_CONFIDENCE_THRESHOLD
+
+model = YOLO(MODEL_PATH)
+
+try:
+    model.to("cpu")
+except Exception:
+    pass
+
+
+def detect_objects(frame, confidence_threshold=None):
+    """
+    Р”РµС‚РµРєС†С–СЏ РѕР±'С”РєС‚С–РІ РЅР° РєР°РґСЂС–.
+    """
+    if frame is None:
+        return []
+
+    threshold = (
+        confidence_threshold
+        if confidence_threshold is not None
+        else DETECTION_CONFIDENCE_THRESHOLD
+    )
+
+    results = model.predict(
+        frame,
+        verbose=False,
+        device="cpu"
+    )[0]
+
+    detected_objects = []
+
+    if results.boxes is None:
+        return detected_objects
+
+    for box, cls, conf in zip(
+        results.boxes.xyxy,
+        results.boxes.cls,
+        results.boxes.conf
+    ):
+        class_id = int(cls.item()) if hasattr(cls, "item") else int(cls)
+        confidence = float(conf.item()) if hasattr(conf, "item") else float(conf)
+
+        class_name = model.names[class_id]
+
+        if class_name not in ALERT_CLASSES:
+            continue
+
+        if confidence < threshold:
+            continue
+
+        bbox = [int(x) for x in box.tolist()]
+
+        detected_objects.append({
+            "class": class_id,
+            "name": class_name,
+            "confidence": confidence,
+            "bbox": bbox,
+        })
+
+    return detected_objects
+# events.py
+from config import ALERT_CLASSES, DETECTION_CONFIDENCE_THRESHOLD
+from notifications import send_telegram_message
+from db import log_event, can_send_event
+
+
+EVENT_TYPE_MAP = {
+    "person": "Р›СЋРґРёРЅР° Сѓ РєР°РґСЂС–",
+    "car": "РђРІС‚РѕРјРѕР±С–Р»СЊ Сѓ РєР°РґСЂС–",
+    "bicycle": "Р’РµР»РѕСЃРёРїРµРґ Сѓ РєР°РґСЂС–",
+    "truck": "Р’Р°РЅС‚Р°Р¶С–РІРєР° Сѓ РєР°РґСЂС–",
+    "motorcycle": "РњРѕС‚РѕС†РёРєР» Сѓ РєР°РґСЂС–",
+}
+
+
+def get_event_type(object_name):
+    """
+    РџРµСЂРµС‚РІРѕСЂСЋС” РєР»Р°СЃ YOLO Сѓ Р·СЂРѕР·СѓРјС–Р»РёР№ С‚РёРї РїРѕРґС–С—.
+    """
+    return EVENT_TYPE_MAP.get(
+        object_name,
+        f"Р’РёСЏРІР»РµРЅРѕ РѕР±'С”РєС‚: {object_name}"
+    )
+
+
+def generate_events(
+    objects,
+    frame_number,
+    camera_id="CAM-01",
+    confidence_threshold=None,
+    event_interval=None,
+    send_notifications=True,
+):
+    """
+    Р“РµРЅРµСЂСѓС” РїРѕРґС–С— РґР»СЏ РІРёСЏРІР»РµРЅРёС… РѕР±'С”РєС‚С–РІ.
+    """
+    threshold = (
+        confidence_threshold
+        if confidence_threshold is not None
+        else DETECTION_CONFIDENCE_THRESHOLD
+    )
+
+    events = []
+
+    for obj in objects:
+        object_name = obj.get("name")
+        confidence = float(obj.get("confidence", 0))
+
+        if object_name not in ALERT_CLASSES:
+            continue
+
+        if confidence < threshold:
+            continue
+
+        cooldown_key = f"{camera_id}:{object_name}"
+
+        if not can_send_event(cooldown_key, interval=event_interval):
+            continue
+
+        event_type = get_event_type(object_name)
+
+        event = {
+            "frame": frame_number,
+            "object_class": object_name,
+            "bbox": obj.get("bbox", []),
+            "confidence": confidence,
+            "event_type": event_type,
+            "camera_id": camera_id,
+        }
+
+        events.append(event)
+
+        log_event(
+            frame=frame_number,
+            object_class=object_name,
+            event_type=event_type,
+            bbox=obj.get("bbox", []),
+            confidence=confidence,
+            camera_id=camera_id,
+        )
+
+        if send_notifications:
+            message = (
+                f"рџ”” {event_type}\n"
+                f"РљР°РјРµСЂР°: {camera_id} | РљР°РґСЂ: {frame_number}\n"
+                f"Р’РїРµРІРЅРµРЅС–СЃС‚СЊ: {confidence:.0%}"
+            )
+            send_telegram_message(message)
+
+    return events
+import sys
+import cv2
+from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QFileDialog, QTextEdit, QHBoxLayout
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QTimer
+
+from camera import get_video_capture, read_frame
+from preprocessing import preprocess_frame
+from detector import detect_objects
+from events import generate_events
+from db import init_db
+
+
+def draw_boxes(frame, objects, model_size=(640, 640)):
+    """
+    РќР°РєР»Р°РґР°С” bounding boxes РЅР° РєР°РґСЂ.
+    РњР°СЃС€С‚Р°Р±СѓС” bbox Р· РјРѕРґРµР»С– 640x640 РґРѕ СЂРѕР·РјС–СЂСѓ РѕСЂРёРіС–РЅР°Р»СЊРЅРѕРіРѕ РєР°РґСЂСѓ.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+
+    output_frame = frame.copy()
+    frame_h, frame_w = output_frame.shape[:2]
+    scale_x = frame_w / model_size[0]
+    scale_y = frame_h / model_size[1]
+
+    for obj in objects:
+        bbox = obj.get('bbox', [])
+        if len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = [int(coord * scale) for coord, scale in zip(bbox, [scale_x, scale_y, scale_x, scale_y])]
+        name = obj.get('name', 'object')
+        confidence = float(obj.get('confidence', 0))
+        cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(output_frame, f"{name}:{confidence:.2f}", (x1, max(y1 - 5, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return output_frame
+
+
+class VideoSurveillanceGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        init_db()  # РЎС‚РІРѕСЂСЋС”РјРѕ Р‘Р” РЅР° СЃС‚Р°СЂС‚С–
+
+        self.setWindowTitle("Intelligent Video Surveillance MVP")
+        self.setGeometry(100, 100, 1200, 700)
+
+        self.cap = None
+        self.frame_number = 0
+        self.single_image_mode = False
+        self.model_frame_size = (640, 640)
+
+        main_layout = QHBoxLayout()
+        video_layout = QVBoxLayout()
+        controls_layout = QVBoxLayout()
+
+        # Р’С–РґРµРѕ
+        self.label = QLabel("Video Stream")
+        self.label.setMinimumSize(640, 480)
+        video_layout.addWidget(self.label)
+
+        # РўРµСЂРјС–РЅР°Р»
+        self.terminal = QTextEdit()
+        self.terminal.setReadOnly(True)
+        video_layout.addWidget(self.terminal)
+
+        # РљРЅРѕРїРєР° РєР°РјРµСЂРё
+        self.btn_camera = QPushButton("Р—Р°РїСѓСЃС‚РёС‚Рё РєР°РјРµСЂСѓ")
+        self.btn_camera.clicked.connect(self.start_camera)
+        controls_layout.addWidget(self.btn_camera)
+
+        # РљРЅРѕРїРєР° С„Р°Р№Р»Сѓ
+        self.btn_file = QPushButton("Р—Р°РІР°РЅС‚Р°Р¶РёС‚Рё РІС–РґРµРѕ/РєР°РґСЂ")
+        self.btn_file.clicked.connect(self.load_file)
+        controls_layout.addWidget(self.btn_file)
+
+        # Р—Р°РіР»СѓС€РєР° Р·РѕРЅ
+        self.btn_zones = QPushButton("РќР°Р»Р°С€С‚СѓРІР°С‚Рё Р·РѕРЅРё")
+        self.btn_zones.clicked.connect(lambda: self.terminal.append("РќР°Р»Р°С€С‚СѓРІР°РЅРЅСЏ Р·РѕРЅ РїРѕРєРё РЅРµРґРѕСЃС‚СѓРїРЅРµ"))
+        controls_layout.addWidget(self.btn_zones)
+
+        main_layout.addLayout(video_layout, 3)
+        main_layout.addLayout(controls_layout, 1)
+        self.setLayout(main_layout)
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+
+    def release_current_source(self):
+        self.timer.stop()
+        if self.cap is not None and hasattr(self.cap, "release"):
+            self.cap.release()
+        self.cap = None
+        self.single_image_mode = False
+
+    def start_camera(self):
+        try:
+            self.release_current_source()
+            self.cap = get_video_capture(0)
+            self.frame_number = 0
+            self.single_image_mode = False
+            self.terminal.append("РљР°РјРµСЂСѓ Р·Р°РїСѓС‰РµРЅРѕ")
+            self.timer.start(30)
+        except Exception as e:
+            self.terminal.append(f"РџРѕРјРёР»РєР° РїС–РґРєР»СЋС‡РµРЅРЅСЏ РєР°РјРµСЂРё: {e}")
+
+    def load_file(self):
+        try:
+            path, _ = QFileDialog.getOpenFileName(self, "Open Video File or Frame", "", "Media Files (*.jpg *.jpeg *.png *.mp4)")
+            if not path:
+                return
+            self.release_current_source()
+            self.cap = get_video_capture(path)
+            self.single_image_mode = path.lower().endswith(('.jpg', '.jpeg', '.png'))
+            self.frame_number = 0
+            self.terminal.append(f"Р¤Р°Р№Р» Р·Р°РІР°РЅС‚Р°Р¶РµРЅРѕ: {path}")
+            self.timer.start(30)
+        except Exception as e:
+            self.terminal.append(f"РџРѕРјРёР»РєР° Р·Р°РІР°РЅС‚Р°Р¶РµРЅРЅСЏ С„Р°Р№Р»Сѓ: {e}")
+
+    def update_frame(self):
+        if self.cap is None:
+            return
+        frame = read_frame(self.cap)
+        if frame is None:
+            self.timer.stop()
+            self.terminal.append("РљР°РґСЂ РЅРµРґРѕСЃС‚СѓРїРЅРёР№ Р°Р±Рѕ РїРѕС‚С–Рє Р·Р°РІРµСЂС€РµРЅРѕ")
+            return
+        frame_proc = preprocess_frame(frame, size=self.model_frame_size)
+        if frame_proc is None:
+            self.timer.stop()
+            self.terminal.append("РљР°РґСЂ РЅРµ РѕР±СЂРѕР±Р»РµРЅРѕ")
+            return
+
+        objects = detect_objects(frame_proc)
+        events = generate_events(objects, self.frame_number)
+
+        self.terminal.append(f"--- РљР°РґСЂ {self.frame_number} ---")
+        if events:
+            for event in events:
+                self.terminal.append(
+                    f"РџРѕРґС–СЏ: {event['event_type']} | "
+                    f"РћР±'С”РєС‚: {event['object_class']} | "
+                    f"bbox: {event['bbox']} | "
+                    f"Р№РјРѕРІС–СЂРЅС–СЃС‚СЊ: {event['confidence']:.2f}"
+                )
+        else:
+            self.terminal.append("РџРѕРґС–Р№ РЅРµ РІРёСЏРІР»РµРЅРѕ")
+
+        self.frame_number += 1
+
+        # РњР°Р»СЋС”РјРѕ bounding boxes
+        frame_with_boxes = draw_boxes(frame, objects, model_size=self.model_frame_size)
+        frame_rgb = cv2.cvtColor(frame_with_boxes, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        bytes_per_line = ch * w
+        q_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.label.setPixmap(QPixmap.fromImage(q_img))
+
+        if self.single_image_mode:
+            self.timer.stop()
+
+    def closeEvent(self, event):
+        self.release_current_source()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = VideoSurveillanceGUI()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+# main.py
+import sys
+from PyQt5.QtWidgets import QApplication
+from gui import VideoSurveillanceGUI
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = VideoSurveillanceGUI()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
+import urllib.parse
+import urllib.request
+
+
+try:
+    from config import TELEGRAM_BOT_TOKEN, CHAT_ID
+except ImportError:
+    try:
+        from config import BOT_TOKEN as TELEGRAM_BOT_TOKEN, CHAT_ID
+    except ImportError:
+        TELEGRAM_BOT_TOKEN = None
+        CHAT_ID = None
+
+
+def send_telegram_message(message):
+    """
+    РЎРёРЅС…СЂРѕРЅРЅРµ РЅР°РґСЃРёР»Р°РЅРЅСЏ Telegram-РїРѕРІС–РґРѕРјР»РµРЅРЅСЏ С‡РµСЂРµР· HTTP API.
+
+    Р¦Рµ РїСЂРёР±РёСЂР°С” РїСЂРѕР±Р»РµРјСѓ:
+    RuntimeWarning: coroutine 'Bot.send_message' was never awaited
+    """
+
+    try:
+        if not TELEGRAM_BOT_TOKEN or not CHAT_ID:
+            print("Telegram РЅРµ РЅР°Р»Р°С€С‚РѕРІР°РЅРёР№: РїРµСЂРµРІС–СЂ TELEGRAM_BOT_TOKEN С– CHAT_ID Сѓ config.py")
+            return False
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+        data = urllib.parse.urlencode({
+            "chat_id": CHAT_ID,
+            "text": message
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            url=url,
+            data=data,
+            method="POST"
+        )
+
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                print(f"РџРѕРјРёР»РєР° Telegram: HTTP {response.status}")
+                return False
+
+        return True
+
+    except Exception as e:
+        print("РџРѕРјРёР»РєР° Telegram:", e)
+        return False
+import cv2
+
+
+def preprocess_frame(frame, size=(640, 640)):
+    """
+    РџРѕРїРµСЂРµРґРЅСЏ РѕР±СЂРѕР±РєР° РєР°РґСЂСѓ:
+    - РїРµСЂРµРІС–СЂРєР° РЅР° РїРѕСЂРѕР¶РЅС–Р№ РєР°РґСЂ;
+    - РјР°СЃС€С‚Р°Р±СѓРІР°РЅРЅСЏ;
+    - РєРѕРЅРІРµСЂС‚Р°С†С–СЏ BGR -> RGB;
+    - Р»РµРіРєРµ Р·РіР»Р°РґР¶СѓРІР°РЅРЅСЏ С€СѓРјС–РІ.
+    """
+
+    if frame is None or frame.size == 0:
+        return None
+
+    frame_resized = cv2.resize(frame, size)
+    frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+
+    # Р¤С–Р»СЊС‚СЂР°С†С–СЏ С€СѓРјС–РІ РґР»СЏ СЃС‚Р°Р±С–Р»СЊРЅС–С€РѕС— РґРµС‚РµРєС†С–С—
+    frame_filtered = cv2.GaussianBlur(frame_rgb, (3, 3), 0)
+
+    return frame_filtered
+import asyncio
+from telegram import Bot
+
+# Р’СЃС‚Р°РІ СЃСЋРґРё СЃРІС–Р№ С‚РѕРєРµРЅ Р±РѕС‚Р°
+BOT_TOKEN = "8854057150:AAFgD-vSYJaE4kotJu9iCSZVoBNsXT47Eck"
+
+bot = Bot(token=BOT_TOKEN)
+
+async def get_chat_ids():
+    updates = await bot.get_updates()
+    if not updates:
+        print("РќРµРјР°С” РЅРѕРІРёС… РѕРЅРѕРІР»РµРЅСЊ. РќР°РґС–С€Р»Рё РїРѕРІС–РґРѕРјР»РµРЅРЅСЏ Р±РѕС‚Сѓ РІ Telegram.")
+    for u in updates:
+        if u.message:
+            print(f"chat_id: {u.message.chat.id}  |  username: {u.message.chat.username}")
+
+# Р—Р°РїСѓСЃРє Р°СЃРёРЅС…СЂРѕРЅРЅРѕС— С„СѓРЅРєС†С–С—
+asyncio.run(get_chat_ids())
+# test_all.py
+import sys
+
+print("=== РџРµСЂРµРІС–СЂРєР° numpy ===")
+try:
+    import numpy as np
+    a = np.array([1, 2, 3])
+    print("numpy РїСЂР°С†СЋС”:", a)
+except Exception as e:
+    print("РџРѕРјРёР»РєР° numpy:", e)
+
+print("\n=== РџРµСЂРµРІС–СЂРєР° OpenCV ===")
+try:
+    import cv2
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        print("OpenCV РїСЂР°С†СЋС”, СЂРѕР·РјС–СЂ РєР°РґСЂСѓ:", frame.shape)
+    else:
+        print("OpenCV РїСЂР°С†СЋС”, Р°Р»Рµ РєР°РјРµСЂР° РЅРµ РґРѕСЃС‚СѓРїРЅР°")
+except Exception as e:
+    print("РџРѕРјРёР»РєР° OpenCV:", e)
+
+print("\n=== РџРµСЂРµРІС–СЂРєР° PyQt5 ===")
+try:
+    from PyQt5.QtWidgets import QApplication, QLabel
+    app = QApplication(sys.argv)
+    label = QLabel("PyQt5 РїСЂР°С†СЋС”")
+    # РќРµ РїРѕРєР°Р·СѓС”РјРѕ РІС–РєРЅРѕ, Р»РёС€Рµ РїРµСЂРµРІС–СЂРєР° С–РјРїРѕСЂС‚Сѓ
+    print("PyQt5 С–РјРїРѕСЂС‚ СѓСЃРїС–С€РЅРёР№")
+except Exception as e:
+    print("РџРѕРјРёР»РєР° PyQt5:", e)
+
+print("\n=== РџРµСЂРµРІС–СЂРєР° PyTorch ===")
+try:
+    import torch
+    import torchvision
+    x = torch.rand(2, 3)
+    print("PyTorch РїСЂР°С†СЋС” РЅР° РїСЂРёСЃС‚СЂРѕС—:", x.device)
+except Exception as e:
+    print("РџРѕРјРёР»РєР° PyTorch:", e)
+
+print("\n=== РџРµСЂРµРІС–СЂРєР° python-telegram-bot ===")
+try:
+    from telegram import Bot
+    print("Telegram Bot С–РјРїРѕСЂС‚ СѓСЃРїС–С€РЅРёР№")
+except Exception as e:
+    print("РџРѕРјРёР»РєР° Telegram Bot:", e)
+
+print("\n=== Р’РЎР• РџР•Р Р•Р’Р†Р Р•РќРћ ===")
+
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\README.md ====================
+
+# Video Surveillance MVP
+Базова десктопна система інтелектуального відеоспостереження на Python.
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\requirements.txt ====================
+
+opencv-python
+PyQt5
+ultralytics
+numpy
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\telegram_notifier.py ====================
+
+import asyncio
+from telegram import Bot
+
+# Встав сюди свій токен бота
+BOT_TOKEN = "8854057150:AAFgD-vSYJaE4kotJu9iCSZVoBNsXT47Eck"
+
+bot = Bot(token=BOT_TOKEN)
+
+async def get_chat_ids():
+    updates = await bot.get_updates()
+    if not updates:
+        print("Немає нових оновлень. Надішли повідомлення боту в Telegram.")
+    for u in updates:
+        if u.message:
+            print(f"chat_id: {u.message.chat.id}  |  username: {u.message.chat.username}")
+
+# Запуск асинхронної функції
+asyncio.run(get_chat_ids())
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\test_all.py ====================
+
+# test_all.py
+import sys
+
+print("=== Перевірка numpy ===")
+try:
+    import numpy as np
+    a = np.array([1, 2, 3])
+    print("numpy працює:", a)
+except Exception as e:
+    print("Помилка numpy:", e)
+
+print("\n=== Перевірка OpenCV ===")
+try:
+    import cv2
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        print("OpenCV працює, розмір кадру:", frame.shape)
+    else:
+        print("OpenCV працює, але камера не доступна")
+except Exception as e:
+    print("Помилка OpenCV:", e)
+
+print("\n=== Перевірка PyQt5 ===")
+try:
+    from PyQt5.QtWidgets import QApplication, QLabel
+    app = QApplication(sys.argv)
+    label = QLabel("PyQt5 працює")
+    # Не показуємо вікно, лише перевірка імпорту
+    print("PyQt5 імпорт успішний")
+except Exception as e:
+    print("Помилка PyQt5:", e)
+
+print("\n=== Перевірка PyTorch ===")
+try:
+    import torch
+    import torchvision
+    x = torch.rand(2, 3)
+    print("PyTorch працює на пристрої:", x.device)
+except Exception as e:
+    print("Помилка PyTorch:", e)
+
+print("\n=== Перевірка python-telegram-bot ===")
+try:
+    from telegram import Bot
+    print("Telegram Bot імпорт успішний")
+except Exception as e:
+    print("Помилка Telegram Bot:", e)
+
+print("\n=== ВСЕ ПЕРЕВІРЕНО ===")
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\zones.json ====================
+
+[]
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\zones.py ====================
+
+# zones.py — Управління зонами виявлення
+import json
+import os
+import cv2
+import numpy as np
+
+ZONES_FILE = "zones.json"
+
+
+def load_zones() -> list[dict]:
+    """
+    Завантажує зони з JSON-файлу.
+    Кожна зона: {"name": str, "points": [[x,y], ...], "enabled": bool}
+    """
+    if not os.path.exists(ZONES_FILE):
+        return []
+    try:
+        with open(ZONES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"Помилка завантаження зон: {e}")
+        return []
+
+
+def save_zones(zones: list[dict]) -> bool:
+    """Зберігає зони у JSON-файл."""
+    try:
+        with open(ZONES_FILE, "w", encoding="utf-8") as f:
+            json.dump(zones, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Помилка збереження зон: {e}")
+        return False
+
+
+def point_in_polygon(point: tuple[int, int], polygon: list[list[int]]) -> bool:
+    """
+    Перевіряє чи точка знаходиться всередині полігону.
+    Використовує алгоритм ray casting.
+    """
+    if len(polygon) < 3:
+        return False
+    pts = np.array(polygon, dtype=np.int32)
+    result = cv2.pointPolygonTest(pts, (float(point[0]), float(point[1])), False)
+    return result >= 0
+
+
+def bbox_intersects_zone(bbox: list[int], zone_points: list[list[int]]) -> bool:
+    """
+    Перевіряє чи bounding box перетинається із зоною.
+    Використовує центр bbox.
+    """
+    if len(bbox) != 4 or len(zone_points) < 3:
+        return False
+
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2  # зміна: центр bbox, а не нижній край
+
+    return point_in_polygon((cx, cy), zone_points)
+
+
+def bbox_intersects_any_zone(bbox: list[int], zones: list[dict]) -> tuple[bool, str | None]:
+    """
+    Перевіряє чи bbox перетинається з будь-якою увімкненою зоною.
+    Повертає (True, zone_name) або (False, None).
+    """
+    for zone in zones:
+        if not zone.get("enabled", True):
+            continue
+        points = zone.get("points", [])
+        if bbox_intersects_zone(bbox, points):
+            return True, zone.get("name", "Зона")
+    return False, None
+
+
+def draw_zones_on_frame(
+    frame: np.ndarray,
+    zones: list[dict],
+    frame_w: int,
+    frame_h: int,
+    original_w: int = 640,
+    original_h: int = 640,
+    alpha: float = 0.25,
+) -> np.ndarray:
+    """
+    Малює зони на кадрі з напівпрозорим заливанням.
+    Масштабує координати зон під поточний розмір кадру.
+    """
+    if not zones:
+        return frame
+
+    overlay = frame.copy()
+    scale_x = frame_w / original_w
+    scale_y = frame_h / original_h
+
+    zone_colors = [
+        (0, 200, 255),   # жовтий
+        (255, 100, 0),   # блакитний
+        (0, 255, 100),   # зелений
+        (200, 0, 255),   # фіолетовий
+        (0, 128, 255),   # помаранчевий
+    ]
+
+    for i, zone in enumerate(zones):
+        if not zone.get("enabled", True):
+            continue
+        points = zone.get("points", [])
+        if len(points) < 3:
+            continue
+
+        scaled = [
+            [int(p[0] * scale_x), int(p[1] * scale_y)]
+            for p in points
+        ]
+        pts = np.array(scaled, dtype=np.int32)
+        color = zone_colors[i % len(zone_colors)]
+
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
+
+        # Підпис зони
+        if scaled:
+            label_x = min(p[0] for p in scaled)
+            label_y = min(p[1] for p in scaled) - 6
+            label_y = max(label_y, 14)
+            cv2.putText(
+                frame,
+                zone.get("name", f"Зона {i+1}"),
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    return frame
+
+
+==================== C:\Users\koche\PycharmProjects\VideoSurveillanceMVP\zone_editor.py ====================
+
+# zone_editor.py — Діалог малювання зон на відео-кадрі
+import cv2
+import numpy as np
+
+from PyQt5.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QWidget,
+    QCheckBox,
+    QSplitter,
+)
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPolygon
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
+
+from zones import load_zones, save_zones
+
+
+class ZoneCanvas(QLabel):
+    """
+    Канвас для малювання полігон-зони мишею.
+    Клік лівою — додає точку.
+    Клік правою — закриває полігон.
+    """
+    zone_finished = pyqtSignal(list)  # список точок [[x,y], ...]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(640, 480)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.CrossCursor)
+
+        self._base_pixmap: QPixmap | None = None
+        self._points: list[QPoint] = []
+        self._drawing = False
+
+    def set_frame(self, frame_bgr: np.ndarray):
+        """Встановлює базовий кадр як фон полотна."""
+        if frame_bgr is None or frame_bgr.size == 0:
+            return
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        q_img = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self._base_pixmap = QPixmap.fromImage(q_img).scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self._points = []
+        self._drawing = False
+        self._redraw()
+
+    def start_drawing(self):
+        self._points = []
+        self._drawing = True
+        self._redraw()
+
+    def clear_points(self):
+        self._points = []
+        self._drawing = False
+        self._redraw()
+
+    def mousePressEvent(self, event):
+        if not self._drawing:
+            return
+        if event.button() == Qt.LeftButton:
+            self._points.append(event.pos())
+            self._redraw()
+        elif event.button() == Qt.RightButton:
+            self._finish_polygon()
+
+    def _finish_polygon(self):
+        if len(self._points) < 3:
+            return
+
+        # Конвертуємо точки канвасу у координати оригінального кадру (640x640)
+        if self._base_pixmap is None:
+            return
+
+        pm_w = self._base_pixmap.width()
+        pm_h = self._base_pixmap.height()
+
+        # offset — де пікселей починається зображення всередині QLabel
+        label_w = self.width()
+        label_h = self.height()
+        offset_x = (label_w - pm_w) // 2
+        offset_y = (label_h - pm_h) // 2
+
+        points_norm = []
+        for p in self._points:
+            rel_x = p.x() - offset_x
+            rel_y = p.y() - offset_y
+            # Нормалізуємо до 640x640
+            norm_x = int(rel_x * 640 / pm_w)
+            norm_y = int(rel_y * 640 / pm_h)
+            norm_x = max(0, min(norm_x, 640))
+            norm_y = max(0, min(norm_y, 640))
+            points_norm.append([norm_x, norm_y])
+
+        self._drawing = False
+        self.zone_finished.emit(points_norm)
+        self._redraw()
+
+    def _redraw(self):
+        if self._base_pixmap is None:
+            self.setText("Немає кадру. Запустіть камеру або відкрийте файл.")
+            return
+
+        result = self._base_pixmap.copy()
+        painter = QPainter(result)
+
+        if self._points:
+            pen = QPen(QColor(0, 220, 255), 2, Qt.SolidLine)
+            painter.setPen(pen)
+
+            # Лінії між точками
+            for i in range(len(self._points) - 1):
+                painter.drawLine(self._points[i], self._points[i + 1])
+
+            # Точки
+            painter.setBrush(QColor(0, 220, 255))
+            for p in self._points:
+                painter.drawEllipse(p, 5, 5)
+
+            # Замикаюча лінія (пунктир)
+            if len(self._points) >= 3 and self._drawing:
+                pen.setStyle(Qt.DashLine)
+                pen.setColor(QColor(255, 200, 0))
+                painter.setPen(pen)
+                painter.drawLine(self._points[-1], self._points[0])
+
+        painter.end()
+        self.setPixmap(result)
+
+
+class ZoneEditorDialog(QDialog):
+    """
+    Повноцінний діалог керування зонами.
+    - Список існуючих зон зліва
+    - Канвас для малювання справа
+    - Кнопки: Нова зона, Видалити, Зберегти
+    """
+
+    zones_updated = pyqtSignal(list)
+
+    def __init__(self, parent=None, current_frame: np.ndarray = None):
+        super().__init__(parent)
+        self.setWindowTitle("Редактор зон виявлення")
+        self.resize(1000, 600)
+        self.setModal(True)
+
+        self._zones = load_zones()
+        self._current_frame = current_frame
+        self._pending_points: list[list[int]] = []
+
+        self._build_ui()
+        self._refresh_list()
+
+        if current_frame is not None:
+            self.canvas.set_frame(current_frame)
+
+    def _build_ui(self):
+        main = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ── Ліва панель (список зон + кнопки) ──
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+
+        self.zone_list = QListWidget()
+        self.zone_list.currentRowChanged.connect(self._on_zone_selected)
+        left_layout.addWidget(QLabel("Зони:"))
+        left_layout.addWidget(self.zone_list)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Назва:"))
+        self.zone_name_edit = QLineEdit()
+        self.zone_name_edit.setPlaceholderText("Наприклад: Вхід")
+        name_row.addWidget(self.zone_name_edit)
+        left_layout.addLayout(name_row)
+
+        self.zone_enabled_cb = QCheckBox("Увімкнена")
+        self.zone_enabled_cb.setChecked(True)
+        left_layout.addWidget(self.zone_enabled_cb)
+
+        btn_new = QPushButton("🖊 Нова зона (малюй мишею)")
+        btn_new.clicked.connect(self._start_new_zone)
+        left_layout.addWidget(btn_new)
+
+        btn_clear = QPushButton("🗑 Очистити поточне малювання")
+        btn_clear.clicked.connect(self.canvas.clear_points if hasattr(self, "canvas") else lambda: None)
+        left_layout.addWidget(btn_clear)
+
+        btn_delete = QPushButton("❌ Видалити вибрану зону")
+        btn_delete.clicked.connect(self._delete_zone)
+        left_layout.addWidget(btn_delete)
+
+        hint = QLabel(
+            "💡 Ліва кнопка миші — додати точку\n"
+            "Права кнопка миші — завершити зону\n"
+            "(мінімум 3 точки)"
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        left_layout.addWidget(hint)
+
+        btn_save = QPushButton("💾 Зберегти всі зони")
+        btn_save.setStyleSheet("background: #2a7; color: white; font-weight: bold; padding: 6px;")
+        btn_save.clicked.connect(self._save_and_close)
+        left_layout.addWidget(btn_save)
+
+        btn_cancel = QPushButton("Скасувати")
+        btn_cancel.clicked.connect(self.reject)
+        left_layout.addWidget(btn_cancel)
+
+        splitter.addWidget(left)
+
+        # ── Права панель (канвас) ──
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+
+        self.canvas = ZoneCanvas()
+        self.canvas.zone_finished.connect(self._on_zone_drawn)
+        right_layout.addWidget(self.canvas)
+
+        # Тепер прив'язуємо btn_clear до реального canvas
+        btn_clear.clicked.disconnect()
+        btn_clear.clicked.connect(self.canvas.clear_points)
+
+        splitter.addWidget(right)
+        splitter.setSizes([280, 720])
+
+        main.addWidget(splitter)
+
+        if self._current_frame is not None:
+            self.canvas.set_frame(self._current_frame)
+
+    def _refresh_list(self):
+        self.zone_list.clear()
+        for zone in self._zones:
+            status = "✅" if zone.get("enabled", True) else "⛔"
+            pts = len(zone.get("points", []))
+            item = QListWidgetItem(f"{status} {zone['name']}  ({pts} точок)")
+            self.zone_list.addItem(item)
+
+    def _on_zone_selected(self, row: int):
+        if 0 <= row < len(self._zones):
+            zone = self._zones[row]
+            self.zone_name_edit.setText(zone.get("name", ""))
+            self.zone_enabled_cb.setChecked(zone.get("enabled", True))
+            # Відобразити зону на кадрі
+            self._draw_zone_preview(zone)
+
+    def _draw_zone_preview(self, zone: dict):
+        if self._current_frame is None:
+            return
+        frame_copy = self._current_frame.copy()
+        from zones import draw_zones_on_frame
+        h, w = frame_copy.shape[:2]
+        frame_copy = draw_zones_on_frame(frame_copy, [zone], w, h)
+        self.canvas.set_frame(frame_copy)
+
+    def _start_new_zone(self):
+        name = self.zone_name_edit.text().strip() or f"Зона {len(self._zones)+1}"
+        self._pending_name = name
+        self._pending_enabled = self.zone_enabled_cb.isChecked()
+        self.canvas.start_drawing()
+
+    def _on_zone_drawn(self, points: list[list[int]]):
+        name = getattr(self, "_pending_name", f"Зона {len(self._zones)+1}")
+        enabled = getattr(self, "_pending_enabled", True)
+        new_zone = {"name": name, "points": points, "enabled": enabled}
+        self._zones.append(new_zone)
+        self._refresh_list()
+        self.zone_list.setCurrentRow(len(self._zones) - 1)
+
+    def _delete_zone(self):
+        row = self.zone_list.currentRow()
+        if row < 0 or row >= len(self._zones):
+            return
+        name = self._zones[row]["name"]
+        reply = QMessageBox.question(
+            self,
+            "Підтвердження",
+            f"Видалити зону «{name}»?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._zones.pop(row)
+            self._refresh_list()
+            if self._current_frame is not None:
+                self.canvas.set_frame(self._current_frame)
+
+    def _save_and_close(self):
+        save_zones(self._zones)
+        self.zones_updated.emit(self._zones)
+        self.accept()

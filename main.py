@@ -1,12 +1,11 @@
 # main.py
 import sys
 from PyQt5.QtWidgets import QApplication
-from gui import VideoSurveillanceGUI
-
+from gui import VisionGuardGUI  # <-- тут правильна назва класу
 
 def main():
     app = QApplication(sys.argv)
-    window = VideoSurveillanceGUI()
+    window = VisionGuardGUI()  # <-- замінити VideoSurveillanceGUI на VisionGuardGUI
     window.show()
     sys.exit(app.exec_())
 
